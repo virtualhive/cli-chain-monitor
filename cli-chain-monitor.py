@@ -1,16 +1,19 @@
+#!/usr/bin/python3
+
 import curses
 import json
-import urllib.request, urllib.parse
 import math
-from time import time
+from time import time, sleep
+from datetime import datetime
 import re
 import binascii
 import hashlib
+from argparse import ArgumentParser
+import utils.request_helper as rh
+import utils.layout_helper as lh
+import utils.cosmos_validator as cv
 
-
-PROVIDER_REST_API = 'https://cosmos-lcd.easy2stake.com'
-CONSUMER_RPC_API = 'https://rpc-neutron.cosmos-spaces.cloud/'
-
+CURRENT_LINE = 0
 
 # necessary because curses is unable to determine width of flags and some other emojis
 EMOJI_PATTERN = re.compile(
@@ -19,130 +22,95 @@ EMOJI_PATTERN = re.compile(
     "\U0000269B\U0000FE0F"
     "]+"
 )
-AGENT_HEADER = 'cli-chain-monitor'
 
 def strip_emoji(text):
     return EMOJI_PATTERN.sub(r'', text)
 
+def request_initial_data(stdscr):
+    global CURRENT_LINE
 
-def get_provider_vals(stdscr):
-    stdscr.addstr(2, 0, 'fetching provider validator info...')
+    # Get chain ID
+    stdscr.addstr(CURRENT_LINE, 0, 'fetching chain id...')
+    CURRENT_LINE += 1
     stdscr.refresh()
-    request = urllib.request.Request(url=PROVIDER_REST_API + '/cosmos/staking/v1beta1/validators',
-                                     headers={'User-Agent': AGENT_HEADER})
-    res = urllib.request.urlopen(request)
-    res_body = res.read()
-    result = json.loads(res_body.decode('utf-8'))
-    provider_vals = result['validators']
+    chain_id = rh.get_chain_id()
 
-    page_key = result['pagination']['next_key']
-    while (page_key is not None):
-        request = urllib.request.Request(url=PROVIDER_REST_API + '/cosmos/staking/v1beta1/validators' + '?pagination.key=%s' % urllib.parse.quote(page_key),
-                                     headers={'User-Agent': AGENT_HEADER})
-        res = urllib.request.urlopen(request)
-        res_body = res.read()
-        result = json.loads(res_body.decode('utf-8'))
-        provider_vals += result['validators']
-        page_key = result['pagination']['next_key']
-
-    return provider_vals
-
-def get_consumer_vals(stdscr):
-    stdscr.addstr(3, 0, 'fetching consumer validator info...')
+    # Get provider validators if URL is given
+    provider_validators = []
+    if rh.PROVIDER_REST_API is not None:
+        stdscr.addstr(CURRENT_LINE, 0, 'fetching provider validator info...')
+        CURRENT_LINE += 1
+        stdscr.refresh()
+        provider_validators = rh.get_provider_vals()
+    
+    # Get consumer validators
+    stdscr.addstr(CURRENT_LINE, 0, 'fetching consumer validator info...')
+    CURRENT_LINE += 1
     stdscr.refresh()
-    request = urllib.request.Request(url=CONSUMER_RPC_API + '/validators' + '?per_page=100',
-                                     headers={'User-Agent': AGENT_HEADER})
-    res = urllib.request.urlopen(request)
-    res_body = res.read()
-    result = json.loads(res_body.decode('utf-8'))
-    result_vals = result['result']['validators']
+    validators = rh.get_consumer_vals()
+    consumer_validators = sorted(validators, key=lambda x: int(x['voting_power']), reverse=True)
 
-    page_entries_count = int(result['result']['count'])
-    total_count = int(result['result']['total'])
-    page_no = 1
-    while (page_entries_count < total_count):
-        page_no += 1
-        request = urllib.request.Request(url=CONSUMER_RPC_API + '/validators' + '?per_page=100&page=%s' % page_no,
-                                     headers={'User-Agent': AGENT_HEADER})
-        res = urllib.request.urlopen(request)
-        res_body = res.read()
-        result = json.loads(res_body.decode('utf-8'))
-        page_entries_count += int(result['result']['count'])
-        result_vals += result['result']['validators']
+    return chain_id, provider_validators, consumer_validators
 
-    return result_vals
-
-def get_chain_id(stdscr):
-    stdscr.addstr(1, 0, 'fetching chain id...')
+def print_init(stdscr):
+    global CURRENT_LINE
+    stdscr.erase()
+    stdscr.addstr(CURRENT_LINE, 0, 'initializing...')
+    CURRENT_LINE += 1
     stdscr.refresh()
-    request = urllib.request.Request(url=CONSUMER_RPC_API + '/status',
-                                     headers={'User-Agent': AGENT_HEADER})
-    res = urllib.request.urlopen(request)
-    res_body = res.read()
-    result = json.loads(res_body.decode('utf-8'))
-    network = result['result']['node_info']['network']
-    return network
 
-def get_block():
-    request = urllib.request.Request(url=CONSUMER_RPC_API + '/block',
-                                     headers={'User-Agent': AGENT_HEADER})
-    res = urllib.request.urlopen(request)
-    res_body = res.read()
-    result = json.loads(res_body.decode('utf-8'))
+def only_one_vp_match(validator_list, voting_power_to_find):
+    iterator = iter(validator_list)
+    has_true = any(int(int(x['voting_power'])) == voting_power_to_find for x in iterator)
+    has_another_true = any(int(int(x['voting_power'])) == voting_power_to_find for x in iterator)
+    return has_true and not has_another_true
 
-    return result['result']
-
-
-def refresh_y_limits(validator_list):
-    paging_y_offset = curses.LINES - 2
-    pad_height = len(validator_list)
-    y_scroll_limit = pad_height - curses.LINES + 2
-    if y_scroll_limit < 0:
-        y_scroll_limit = 0
-
-    return paging_y_offset, pad_height, y_scroll_limit
-
-def y_scroll(c, pad_y_scroll, y_scroll_limit, paging_y_offset):
-    if c == curses.KEY_DOWN:
-            if (pad_y_scroll + 1 <= y_scroll_limit):
-                pad_y_scroll += 1
+def init_validator_list(provider_validators, consumer_validators):
+    validators = []
+    token_sum = 0
+    for i in range(0, len(consumer_validators)):
+        moniker_set = False
+        is_diff_pubkey = False
+        for k in range(0, len(provider_validators)):
+            # try to match on public key
+            if (provider_validators[k]['consensus_pubkey']['key'] == consumer_validators[i]['pub_key']['value']):
+                moniker = provider_validators[k]['description']['moniker']
+                moniker_set = True
+                is_diff_pubkey = False
+            # try to match on voting power
+            if not moniker_set:
+                if only_one_vp_match(consumer_validators, int(int(provider_validators[k]['tokens']) / 1000000)):
+                    if (int(int(provider_validators[k]['tokens']) / 1000000) == int(consumer_validators[i]['voting_power'])):
+                        moniker = provider_validators[k]['description']['moniker']
+                        moniker_set = True
+                        is_diff_pubkey = True
+        if not moniker_set:
+            moniker = consumer_validators[i]['address']
+            moniker_set = True
+            is_diff_pubkey = True
+        sanitized_moniker = strip_emoji(moniker)
+        hex_pub_addr = hashlib.sha256(binascii.a2b_base64(consumer_validators[i]['pub_key']['value'])).digest()[:20].hex().upper()
+        token_sum += int(consumer_validators[i]['voting_power'])
+        validators.append(cv.Validator(consumer_validators[i]['pub_key']['value'], hex_pub_addr, is_diff_pubkey,
+            int(consumer_validators[i]['voting_power']), sanitized_moniker))
+    
+    cutoff_5_percent = token_sum * 0.05
+    cutoff_sum = 0
+    is_still_soft_opt_out = True
+    for v in reversed(validators):
+        if is_still_soft_opt_out:
+            cutoff_sum += int(v.voting_power)
+            if cutoff_sum <= cutoff_5_percent:
+                v.soft_opt_out = True
             else:
-                pad_y_scroll = y_scroll_limit
-    if c == curses.KEY_UP:
-        if (pad_y_scroll >= 1):
-            pad_y_scroll -= 1
-        else:
-            pad_y_scroll = 0
-    if c == curses.KEY_NPAGE:
-        if (pad_y_scroll + paging_y_offset <= y_scroll_limit):
-            pad_y_scroll += paging_y_offset
-        else:
-            pad_y_scroll = y_scroll_limit
-    if c == curses.KEY_PPAGE:
-        if (pad_y_scroll >= paging_y_offset):
-            pad_y_scroll -= paging_y_offset
-        else:
-            pad_y_scroll = 0
+                is_still_soft_opt_out = False
+        v.voting_power_percent = float(int(v.voting_power)) / float(token_sum)
 
-    if (pad_y_scroll > y_scroll_limit):
-        pad_y_scroll = y_scroll_limit
-    if y_scroll_limit > 0:
-        scroll_percent = pad_y_scroll / y_scroll_limit
-    else:
-        scroll_percent = 1
-
-    scroll_indicator_y = math.floor(scroll_percent * (curses.LINES - 3)) + 1
-
-    return pad_y_scroll, scroll_indicator_y
-
+    return validators
 
 def main(stdscr):
-
-    curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_BLUE, curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    global CURRENT_LINE
+    lh.init_color_pairs()
 
     # Init screen and scroll
     curses.curs_set(0)
@@ -150,157 +118,166 @@ def main(stdscr):
     stdscr.clear()
     pad_y_scroll = 0
     pad_height = 100 # only used if empty valset
-    scroll_percent = 0
     search_dialog = None
     paging_y_offset = 0
+    pad_begin_x = 1; pad_begin_y = 1
+    height = curses.LINES - 3; width = curses.COLS - 3
+    block_display_start_x = 2+3+29+2+6+1+40+3
 
-    stdscr.erase()
-    stdscr.addstr(0, 0, 'initializing...')
-    stdscr.refresh()
+    # Initializing data
+    print_init(stdscr)
+    chain_id, provider_validators, consumer_validators = request_initial_data(stdscr)
 
-    chain_id = get_chain_id(stdscr)
+    # Init validator list
+    all_validators = init_validator_list(provider_validators, consumer_validators)
+    filtered_validators = all_validators
 
-    provider_validators = []
-    if PROVIDER_REST_API is not None:
-        provider_validators = get_provider_vals(stdscr)
-    validators = get_consumer_vals(stdscr)
-    buffer_vals = sorted(validators, key=lambda x: int(x['voting_power']), reverse=True)
-    filtered_validators = sorted(validators, key=lambda x: int(x['voting_power']), reverse=True)
-
-    # Init block and proposer stuff
+    # Init block and proposer
     last_fetched_time = 0
-    fetched_block = False
     block_buffer = dict()
     buffer_init = False
     current_block = 0
+    last_block = 0
     processed_block = 0
-    this_proposer = None
-    next_proposer = None
+    last_proposer = None
+    current_proposer = None
 
+    # Init timings
+    fetch_interval_seconds = 2
+    block_time_deltas = []
+    last_block_datetime = None
+    average_block_time = 1
+
+    # Create buffer for validator <-> signed info
+    if not buffer_init:
+        for v in all_validators:
+            block_buffer[v.hex_key] = []
+        buffer_init = True
+
+
+    # Main loop retrieving new blocks / refresh screen
     while True:
-        curses.update_lines_cols()
-        paging_y_offset, pad_height, y_scroll_limit = refresh_y_limits(filtered_validators)
+        # Fetch new block
+        if (time() - last_fetched_time) > fetch_interval_seconds:
+            last_proposer = current_proposer
+            block = rh.get_block()
+            if current_block:
+                if int(block['block']['header']['height']) > current_block:
+                    block = rh.get_block_by_height(current_block + 1)
+                    if fetch_interval_seconds > average_block_time and fetch_interval_seconds > 1:
+                        fetch_interval_seconds -= 0.5
+                    block_time = block['block']['header']['time']
+                    current_block_datetime = datetime.strptime(block_time[:26], '%Y-%m-%dT%H:%M:%S.%f')
+                    if last_block_datetime:
+                        block_time_deltas.append((current_block_datetime - last_block_datetime).total_seconds())
+                        if len(block_time_deltas) > 10:
+                            block_time_deltas.pop(0)
+                        average_block_time = sum(block_time_deltas) / len(block_time_deltas)
+                    last_block_datetime = current_block_datetime
+                else:
+                    fetch_interval_seconds += 0.5
 
-        # handle inputs/scroll
+            block_last_commits = block['block']['last_commit']['signatures']
+
+            block_no = block['block']['header']['height']
+            current_block = int(block_no)
+            last_block = current_block - 1
+
+            current_proposer = block['block']['header']['proposer_address']
+
+            last_fetched_time = time()
+
+        # Process (last) block committed signatures
+        if current_block - processed_block:
+            block_last_commits_json = json.dumps(block_last_commits)
+            for v in all_validators:
+                if v.hex_key not in block_last_commits_json:
+                    block_buffer[v.hex_key].append(0)
+                elif v.hex_key == last_proposer:
+                    block_buffer[v.hex_key].append(2)
+                else:
+                    block_buffer[v.hex_key].append(1)
+
+        # UI Stuff
+        # Handle inputs/scroll
         c = stdscr.getch()
-        pad_y_scroll, scroll_indicator_y = y_scroll(c, pad_y_scroll, y_scroll_limit, paging_y_offset)
+        curses.update_lines_cols()
+
+        paging_y_offset, pad_height, y_scroll_limit = lh.refresh_y_limits(filtered_validators)
         if c == ord('s'):
             search_dialog = curses.newwin(3, 40, math.floor(curses.LINES/2) - 1, math.floor(curses.COLS/2) - 20)
             search_dialog.border()
         if c == ord('q'):
             exit()
+        pad_y_scroll, scroll_indicator_y = lh.y_scroll(c, pad_y_scroll, y_scroll_limit, paging_y_offset)
 
-        begin_x = 1; begin_y = 1
         height = curses.LINES - 3; width = curses.COLS - 3
+        pad_width = 205
 
-        # fetch new block
-        if (time() - last_fetched_time) > 4:
-            this_proposer = next_proposer
-            block = get_block()
-            block_last_commits = block['block']['last_commit']['signatures']
-            block_no = block['block']['header']['height']
-            current_block = int(block_no)
-            next_proposer = block['block']['header']['proposer_address']
-            fetched_block = True
-        if fetched_block:
-            last_fetched_time = time()
-            fetched_block = False
+        # Update screen
+        lh.redraw_base_layout(stdscr, scroll_indicator_y, width, last_block, chain_id)
+        stdscr.addstr(0, 20, str(fetch_interval_seconds))
+        stdscr.addstr(0, 25, str(average_block_time))
 
-        if not buffer_init:
-            for i in range(0, len(filtered_validators)):
-                block_buffer[hashlib.sha256(binascii.a2b_base64(filtered_validators[i]['pub_key']['value'])).digest()[:20].hex().upper()] = []
-            buffer_init = True
-
-
-        stdscr.erase()
-        stdscr.border()
-        stdscr.addstr(0, int(curses.COLS/2) - 10, f"{scroll_percent:.0%}")
-        stdscr.addstr(0, int(curses.COLS/2) + 5, str(scroll_indicator_y))
-        stdscr.addstr(scroll_indicator_y, curses.COLS - 2, '█')
-        stdscr.addstr(0, 0, block_no)
-        stdscr.addstr(0, len(block_no) + 2, f"{chain_id}")
-        pad = curses.newpad(pad_height, width)
+        pad = curses.newpad(pad_height, pad_width)
         pad.erase()
 
-
-        token_sum = 0
-        for i in range(0, len(filtered_validators)):
-            moniker_set = False
-            is_diff_pubkey = False
-            for k in range(0, len(provider_validators)):
-                if (provider_validators[k]['consensus_pubkey']['key'] == filtered_validators[i]['pub_key']['value']):
-                    if not moniker_set:
-                        moniker = provider_validators[k]['description']['moniker']
-                        moniker_set = True
-                if (int(int(provider_validators[k]['tokens']) / 1000000) == int(filtered_validators[i]['voting_power'])):
-                    if not moniker_set:
-                        moniker = provider_validators[k]['description']['moniker']
-                        moniker_set = True
-                        is_diff_pubkey = True
-            if not moniker_set:
-                moniker = filtered_validators[i]['address']
-            filtered_validators[i]['moniker'] = moniker
-            if len(moniker) > 30:
-                moniker = moniker[:26] + '...'
-            if is_diff_pubkey:
-                pad.addstr(i, 6, strip_emoji(moniker), curses.color_pair(4))
+        for i, v in enumerate(filtered_validators):
+            if len(v.moniker) > 30:
+                moniker = v.moniker[:26] + '...'
             else:
-                pad.addstr(i, 6, strip_emoji(moniker))
+                moniker = v.moniker
+            if v.key_assigned:
+                pad.addstr(i, 6, moniker, curses.color_pair(4))
+            else:
+                pad.addstr(i, 6, moniker)
+            
             pad.addstr(i, 1, str(i+1))
-            hex_pub_addr = hashlib.sha256(binascii.a2b_base64(filtered_validators[i]['pub_key']['value'])).digest()[:20].hex().upper()
-            pad.addstr(i, 6+30+9, hex_pub_addr)
-            if current_block - processed_block:
-                if hex_pub_addr not in json.dumps(block_last_commits):
-                    block_buffer[hex_pub_addr].append(0)
-                elif hex_pub_addr == this_proposer:
-                    block_buffer[hex_pub_addr].append(2)
+            pad.addstr(i, 6+30+9, v.hex_key)
+
+            if v.soft_opt_out:
+                pad.addstr(i, 38, f"{v.voting_power_percent:.2%}", curses.color_pair(5))
+            else:
+                pad.addstr(i, 38, f"{v.voting_power_percent:.2%}")
+            
+            if block_display_start_x + len(block_buffer[v.hex_key]) >= width:
+                block_display_offset = (block_display_start_x + len(block_buffer[v.hex_key])) - width
+            else:
+                block_display_offset = 0
+            for k in range(block_display_offset, len(block_buffer[v.hex_key])):
+                if block_buffer[v.hex_key][k]:
+                    if block_buffer[v.hex_key][k] == 2:
+                        pad.addstr(i, block_display_start_x + k - block_display_offset, '■', curses.color_pair(3))
+                    else:
+                        pad.addstr(i, block_display_start_x + k - block_display_offset, '■', curses.color_pair(2))
                 else:
-                    block_buffer[hex_pub_addr].append(1)
-            token_sum += int(filtered_validators[i]['voting_power'])
+                    pad.addstr(i, block_display_start_x + k - block_display_offset, '■', curses.color_pair(1))
 
         processed_block = current_block
 
-
-        cutoff_5_percent = token_sum * 0.05
-        cutoff_sum = 0
-        cutoff_index = 0
-        for i in range(0, len(filtered_validators)):
-            inverted_index = len(filtered_validators) - i - 1
-            cutoff_sum += int(filtered_validators[inverted_index]['voting_power'])
-            if cutoff_sum > cutoff_5_percent:
-                cutoff_index = inverted_index
-                break
-
-        for i in range(0, len(filtered_validators)):
-            if i > cutoff_index:
-                pad.addstr(i, 38, f"{float(int(filtered_validators[i]['voting_power'])) / float(token_sum):.2%}", curses.color_pair(5))
-            else:
-                pad.addstr(i, 38, f"{float(int(filtered_validators[i]['voting_power'])) / float(token_sum):.2%}")
-            hex_pub_addr = hashlib.sha256(binascii.a2b_base64(filtered_validators[i]['pub_key']['value'])).digest()[:20].hex().upper()
-            buffered_block_count = len(block_buffer[hex_pub_addr])
-            for k in range(0, buffered_block_count):
-                if block_buffer[hex_pub_addr][k]:
-                    if block_buffer[hex_pub_addr][k] == 2:
-                        pad.addstr(i, 6+30+9+60+k, '■', curses.color_pair(3))
-                    else:
-                        pad.addstr(i, 6+30+9+60+k, '■', curses.color_pair(2))
-                else:
-                    pad.addstr(i, 6+30+9+60+k, '■', curses.color_pair(1))
-
         stdscr.refresh()
-        pad.refresh(pad_y_scroll, 0, begin_y, begin_x, begin_y + height, begin_x + width)
+        pad.refresh(pad_y_scroll, 0, pad_begin_y, pad_begin_x, pad_begin_y + height, pad_begin_x + width)
+
         if (search_dialog is not None):
             curses.curs_set(1)
             search_dialog.refresh()
             curses.cbreak()
             curses.echo()
             s = search_dialog.getstr(1, 2)
-            filtered_validators = [val for val in buffer_vals if s.decode() in val['moniker']]
+            filtered_validators = [val for val in all_validators if s.decode() in val.moniker]
             if len(filtered_validators) < 1:
-                filtered_validators = buffer_vals
+                filtered_validators = all_validators
             curses.noecho()
             curses.halfdelay(1)
             curses.curs_set(0)
             search_dialog = None
+
+
+parser = ArgumentParser()
+parser.add_argument('consumer_rpc_url', help='consumer chain RPC endpoint URL')
+parser.add_argument('provider_rest_url', nargs='?', help='(optional) provider chain REST endpoint URL')
+args = parser.parse_args()
+
+rh.set_urls(args.consumer_rpc_url, args.provider_rest_url)
 
 curses.wrapper(main)
